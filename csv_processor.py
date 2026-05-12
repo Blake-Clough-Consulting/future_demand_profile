@@ -9,27 +9,25 @@ from datetime import timedelta
 FILENAME_PATTERN = re.compile(r"^GP9_2023(\d{2})\.csv$")
 ACTIVE_REQUIRED_COLUMNS = {"scenario", "year", "DemandPk", "DemandAM", "DemandPM", "type"}
 ACTIVE_DEMAND_COLUMNS = ["DemandPk", "DemandAM", "DemandPM"]
-GROSS_DEMAND_SETPOINTS = {
+DEMAND_SETPOINTS = {
     "winter_peak": {
         "label": "Winter Peak",
         "active_column": "DemandPk",
-        "storage_column": "wintpk",
     },
     "summer_min_am": {
         "label": "Summer Min AM",
         "active_column": "DemandAM",
-        "storage_column": "summam",
     },
     "summer_min_pm": {
         "label": "Summer Min PM",
         "active_column": "DemandPM",
-        "storage_column": "summpm",
     },
 }
 FES_CONTRIBUTION_SHEETS = {
     "mBattery": {
         "scenario_column": "scenario",
         "year_column": "year",
+        "sign": 1,
         "value_columns": {
             "winter_peak": "wintpk",
             "summer_min_am": "summam",
@@ -39,6 +37,27 @@ FES_CONTRIBUTION_SHEETS = {
     "DxStorage": {
         "scenario_column": "scenario",
         "year_column": "year",
+        "sign": 1,
+        "value_columns": {
+            "winter_peak": "wintpk",
+            "summer_min_am": "summam",
+            "summer_min_pm": "summpm",
+        },
+    },
+    "DG": {
+        "scenario_column": "scenario",
+        "year_column": "year",
+        "sign": -1,
+        "value_columns": {
+            "winter_peak": "wintpk",
+            "summer_min_am": "summam",
+            "summer_min_pm": "summpm",
+        },
+    },
+    "Sub1MW": {
+        "scenario_column": "scenario",
+        "year_column": "year",
+        "sign": -1,
         "value_columns": {
             "winter_peak": "wintpk",
             "summer_min_am": "summam",
@@ -434,13 +453,27 @@ def calculate_fes_sheet_contributions(
     return contributions
 
 
-def calculate_gross_demand_setpoints(
+def calculate_gross_demand_setpoints(active_demand_totals: dict) -> dict:
+    gross_setpoints = {}
+
+    for setpoint_key, setpoint_config in DEMAND_SETPOINTS.items():
+        active_value = float(active_demand_totals[setpoint_config["active_column"]])
+        gross_setpoints[setpoint_key] = {
+            "label": setpoint_config["label"],
+            "components": {"Active": active_value},
+            "gross_demand": active_value,
+        }
+
+    return gross_setpoints
+
+
+def calculate_net_demand_setpoints(
     filtered_excel_data: dict,
-    active_demand_totals: dict,
+    gross_demand_setpoints: dict,
     scenario: str,
     year: int,
 ) -> dict:
-    gross_setpoints = {}
+    net_setpoints = {}
     sheet_contributions = {}
 
     for sheet_name in FES_CONTRIBUTION_SHEETS:
@@ -455,27 +488,38 @@ def calculate_gross_demand_setpoints(
             year,
         )
 
-    for setpoint_key, setpoint_config in GROSS_DEMAND_SETPOINTS.items():
-        active_value = float(active_demand_totals[setpoint_config["active_column"]])
-        components = {"Active": active_value}
+    for setpoint_key, setpoint_config in DEMAND_SETPOINTS.items():
+        gross_demand = float(gross_demand_setpoints[setpoint_key]["gross_demand"])
+        components = {"Gross demand (Active)": gross_demand}
 
         for sheet_name in FES_CONTRIBUTION_SHEETS:
-            components[sheet_name] = sheet_contributions[sheet_name][setpoint_key]["value"]
+            raw_value = sheet_contributions[sheet_name][setpoint_key]["value"]
+            signed_value = raw_value * FES_CONTRIBUTION_SHEETS[sheet_name]["sign"]
+            components[sheet_name] = float(signed_value)
 
-        gross_setpoints[setpoint_key] = {
+        net_setpoints[setpoint_key] = {
             "label": setpoint_config["label"],
             "components": components,
-            "gross_demand": float(sum(components.values())),
+            "net_demand": float(sum(components.values())),
         }
 
-    return gross_setpoints
+    return net_setpoints
 
 
 def print_gross_demand_setpoints(gross_demand_setpoints: dict) -> None:
     print("\nGross demand setpoints:")
-    for setpoint_key in GROSS_DEMAND_SETPOINTS:
+    for setpoint_key in DEMAND_SETPOINTS:
         setpoint = gross_demand_setpoints[setpoint_key]
         print(f"  {setpoint['label']}: {setpoint['gross_demand']:,.6f}")
+        for component_name, value in setpoint["components"].items():
+            print(f"    {component_name}: {value:,.6f}")
+
+
+def print_net_demand_setpoints(net_demand_setpoints: dict) -> None:
+    print("\nNet demand setpoints:")
+    for setpoint_key in DEMAND_SETPOINTS:
+        setpoint = net_demand_setpoints[setpoint_key]
+        print(f"  {setpoint['label']}: {setpoint['net_demand']:,.6f}")
         for component_name, value in setpoint["components"].items():
             print(f"    {component_name}: {value:,.6f}")
 
@@ -529,7 +573,8 @@ def prepare_processing_data(excel_data: dict, csv_data: pd.DataFrame) -> dict:
             - 'fes_scenario': The selected Regional FES scenario
             - 'fes_year': The selected Regional FES target year
             - 'active_demand_totals': Active DemandPk/DemandAM/DemandPM totals for scaling
-            - 'gross_demand_setpoints': Gross demand setpoints with Active and storage components
+            - 'gross_demand_setpoints': Gross demand setpoints from Active only
+            - 'net_demand_setpoints': Net demand setpoints after storage and generation adjustments
             - 'csv_profile': The processed CSV data with datetime index, filtered to year
             - 'main_data': The filtered MAIN DATA row(s) for the selected Elexon ID
             - 'gsp_info': The complete GSP info sheet (for reference/lookup)
@@ -572,9 +617,10 @@ def prepare_processing_data(excel_data: dict, csv_data: pd.DataFrame) -> dict:
     active_scenario_data, selected_fes_scenario = prompt_select_fes_scenario(active_data)
     active_year_data, selected_fes_year = prompt_select_fes_year(active_scenario_data)
     active_demand_totals = calculate_active_demand_totals(active_year_data)
-    gross_demand_setpoints = calculate_gross_demand_setpoints(
+    gross_demand_setpoints = calculate_gross_demand_setpoints(active_demand_totals)
+    net_demand_setpoints = calculate_net_demand_setpoints(
         filtered_excel_data,
-        active_demand_totals,
+        gross_demand_setpoints,
         selected_fes_scenario,
         selected_fes_year,
     )
@@ -588,6 +634,7 @@ def prepare_processing_data(excel_data: dict, csv_data: pd.DataFrame) -> dict:
         'fes_year': selected_fes_year,
         'active_demand_totals': active_demand_totals,
         'gross_demand_setpoints': gross_demand_setpoints,
+        'net_demand_setpoints': net_demand_setpoints,
         'csv_profile': csv_filtered,
         'main_data': filtered_excel_data.get('MAIN DATA'),
         'dg_data': filtered_excel_data.get('DG'),
@@ -610,6 +657,7 @@ def prepare_processing_data(excel_data: dict, csv_data: pd.DataFrame) -> dict:
     for column in ACTIVE_DEMAND_COLUMNS:
         print(f"  {column}: {active_demand_totals[column]:,.6f}")
     print_gross_demand_setpoints(gross_demand_setpoints)
+    print_net_demand_setpoints(net_demand_setpoints)
     if processing_data['main_data'] is not None and len(processing_data['main_data']) > 0:
         print(f"MAIN DATA shape: {processing_data['main_data'].shape}")
     if processing_data['dg_data'] is not None and len(processing_data['dg_data']) > 0:
@@ -778,6 +826,7 @@ if __name__ == "__main__":
         fes_year = processing_data['fes_year']
         active_demand_totals = processing_data['active_demand_totals']
         gross_demand_setpoints = processing_data['gross_demand_setpoints']
+        net_demand_setpoints = processing_data['net_demand_setpoints']
         
         # Save CSV profile
         csv_profile.to_csv("filtered_gp9_data.csv")
@@ -793,13 +842,15 @@ if __name__ == "__main__":
             print(f"  {column}: {active_demand_totals[column]:,.6f}")
 
         print_gross_demand_setpoints(gross_demand_setpoints)
+        print_net_demand_setpoints(net_demand_setpoints)
         
         print(f"\n✓ Data preparation complete and ready for profile transformation")
         print(f"  - Use 'processing_data' dict to access all excel and csv data")
         print(f"  - processing_data['csv_profile']: Contains the profile data with set points")
         print(f"  - processing_data['main_data']: Contains the max/min set points from excel")
         print(f"  - processing_data['active_demand_totals']: Contains Active DemandPk/DemandAM/DemandPM totals")
-        print(f"  - processing_data['gross_demand_setpoints']: Contains the three gross demand setpoints")
+        print(f"  - processing_data['gross_demand_setpoints']: Contains Active-only gross demand setpoints")
+        print(f"  - processing_data['net_demand_setpoints']: Contains the final net demand setpoints")
         
         # Plot the selected data
         print(f"\n{'='*80}")
