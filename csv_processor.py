@@ -101,34 +101,67 @@ def prompt_select_gsp_id(df: pd.DataFrame) -> tuple[pd.DataFrame, str]:
         print(f"Please enter a number between 1 and {len(unique_values)}.")
 
 
-def filter_main_data_by_elexon_id(main_data_df: pd.DataFrame, elexon_id: str) -> pd.DataFrame:
+def filter_data_by_elexon_id(excel_data: dict, elexon_id: str) -> dict:
     """
-    Filter the MAIN DATA sheet to rows matching the selected Elexon ID.
+    Filter all excel dataframes by the selected Elexon ID.
+    
+    Filters each sheet using the appropriate Elexon ID column:
+    - MAIN DATA: 'Elexon ID' column
+    - DG: 'etys_location' column
+    - Sub1MW: 'etys_location' column
     
     Args:
-        main_data_df: The MAIN DATA dataframe from the excel file
+        excel_data: Dictionary of all excel sheets from read_excel_file()
         elexon_id: The selected Elexon ID (GSP Id) to filter by
     
     Returns:
-        Filtered dataframe containing only rows where Elexon ID matches the selected value
+        Dictionary containing filtered dataframes for each sheet:
+            - 'MAIN DATA': Filtered MAIN DATA rows
+            - 'DG': Filtered DG rows
+            - 'Sub1MW': Filtered Sub1MW rows
+            - 'GSP info': Unfiltered (reference data)
     """
-    # Try to find the Elexon ID column (could be named differently)
-    elexon_id_columns = [col for col in main_data_df.columns if 'elexon' in col.lower() or 'id' in col.lower()]
+    filtered_data = {}
     
-    if not elexon_id_columns:
-        raise KeyError(f"No Elexon ID column found in MAIN DATA. Available columns: {list(main_data_df.columns)}")
+    # Filter MAIN DATA by 'Elexon ID' column
+    if "MAIN DATA" in excel_data:
+        main_data_df = excel_data["MAIN DATA"]
+        if "Elexon ID" in main_data_df.columns:
+            filtered_main_data = main_data_df[main_data_df["Elexon ID"].astype(str) == str(elexon_id)].reset_index(drop=True)
+            filtered_data["MAIN DATA"] = filtered_main_data
+            print(f"Filtered MAIN DATA to Elexon ID '{elexon_id}': {len(filtered_main_data)} rows")
+        else:
+            print(f"Warning: 'Elexon ID' column not found in MAIN DATA. Available columns: {list(main_data_df.columns)}")
+            filtered_data["MAIN DATA"] = pd.DataFrame()
     
-    # Use the first matching column (typically there should be one)
-    elexon_col = elexon_id_columns[0]
-    print(f"Using column '{elexon_col}' as Elexon ID column.")
+    # Filter DG by 'etys_location' column
+    if "DG" in excel_data:
+        dg_df = excel_data["DG"]
+        if "etys_location" in dg_df.columns:
+            filtered_dg = dg_df[dg_df["etys_location"].astype(str) == str(elexon_id)].reset_index(drop=True)
+            filtered_data["DG"] = filtered_dg
+            print(f"Filtered DG to etys_location '{elexon_id}': {len(filtered_dg)} rows")
+        else:
+            print(f"Warning: 'etys_location' column not found in DG. Available columns: {list(dg_df.columns)}")
+            filtered_data["DG"] = pd.DataFrame()
     
-    filtered_main_data = main_data_df[main_data_df[elexon_col].astype(str) == str(elexon_id)].reset_index(drop=True)
-    print(f"Filtered MAIN DATA to Elexon ID '{elexon_id}' with {len(filtered_main_data)} rows.")
+    # Filter Sub1MW by 'etys_location' column
+    if "Sub1MW" in excel_data:
+        sub1mw_df = excel_data["Sub1MW"]
+        if "etys_location" in sub1mw_df.columns:
+            filtered_sub1mw = sub1mw_df[sub1mw_df["etys_location"].astype(str) == str(elexon_id)].reset_index(drop=True)
+            filtered_data["Sub1MW"] = filtered_sub1mw
+            print(f"Filtered Sub1MW to etys_location '{elexon_id}': {len(filtered_sub1mw)} rows")
+        else:
+            print(f"Warning: 'etys_location' column not found in Sub1MW. Available columns: {list(sub1mw_df.columns)}")
+            filtered_data["Sub1MW"] = pd.DataFrame()
     
-    if len(filtered_main_data) == 0:
-        print(f"Warning: No rows found in MAIN DATA for Elexon ID '{elexon_id}'")
+    # Keep GSP info unfiltered (reference data)
+    if "GSP info" in excel_data:
+        filtered_data["GSP info"] = excel_data["GSP info"]
     
-    return filtered_main_data
+    return filtered_data
+
 
 
 
@@ -252,13 +285,9 @@ def prepare_processing_data(excel_data: dict, csv_data: pd.DataFrame) -> dict:
     print("\nStep 1: Select GSP ID (Elexon ID)")
     csv_filtered, selected_elexon_id = prompt_select_gsp_id(csv_data)
     
-    # Step 2: Filter MAIN DATA by Elexon ID
-    print("\nStep 2: Filtering MAIN DATA by selected Elexon ID")
-    main_data_filtered = None
-    if "MAIN DATA" in excel_data:
-        main_data_filtered = filter_main_data_by_elexon_id(excel_data["MAIN DATA"], selected_elexon_id)
-    else:
-        print("Warning: MAIN DATA sheet not found in excel_data")
+    # Step 2: Filter all excel data by Elexon ID
+    print("\nStep 2: Filtering all excel data by selected Elexon ID")
+    filtered_excel_data = filter_data_by_elexon_id(excel_data, selected_elexon_id)
     
     # Step 3: Create datetime index and filter by year
     print("\nStep 3: Processing CSV data (datetime index and year selection)")
@@ -274,10 +303,10 @@ def prepare_processing_data(excel_data: dict, csv_data: pd.DataFrame) -> dict:
         'elexon_id': selected_elexon_id,
         'year': selected_year,
         'csv_profile': csv_filtered,
-        'main_data': main_data_filtered,
-        'gsp_info': excel_data.get('GSP info'),
-        'dg_data': excel_data.get('DG'),
-        'sub1mw_data': excel_data.get('Sub1MW'),
+        'main_data': filtered_excel_data.get('MAIN DATA'),
+        'dg_data': filtered_excel_data.get('DG'),
+        'sub1mw_data': filtered_excel_data.get('Sub1MW'),
+        'gsp_info': filtered_excel_data.get('GSP info'),
     }
     
     print("\n" + "="*80)
@@ -285,8 +314,12 @@ def prepare_processing_data(excel_data: dict, csv_data: pd.DataFrame) -> dict:
     print(f"Elexon ID: {selected_elexon_id}")
     print(f"Year: {selected_year}")
     print(f"CSV Profile shape: {processing_data['csv_profile'].shape}")
-    if main_data_filtered is not None:
-        print(f"MAIN DATA shape: {main_data_filtered.shape}")
+    if processing_data['main_data'] is not None and len(processing_data['main_data']) > 0:
+        print(f"MAIN DATA shape: {processing_data['main_data'].shape}")
+    if processing_data['dg_data'] is not None and len(processing_data['dg_data']) > 0:
+        print(f"DG shape: {processing_data['dg_data'].shape}")
+    if processing_data['sub1mw_data'] is not None and len(processing_data['sub1mw_data']) > 0:
+        print(f"Sub1MW shape: {processing_data['sub1mw_data'].shape}")
     print("="*80 + "\n")
     
     return processing_data
