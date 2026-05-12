@@ -7,6 +7,57 @@ import matplotlib.dates as mdates  # type: ignore
 from datetime import timedelta
 
 FILENAME_PATTERN = re.compile(r"^GP9_2023(\d{2})\.csv$")
+ACTIVE_REQUIRED_COLUMNS = {"scenario", "year", "DemandPk", "DemandAM", "DemandPM", "type"}
+ACTIVE_DEMAND_COLUMNS = ["DemandPk", "DemandAM", "DemandPM"]
+GROSS_DEMAND_SETPOINTS = {
+    "winter_peak": {
+        "label": "Winter Peak",
+        "active_column": "DemandPk",
+        "lv_gain_column": "Peak",
+        "storage_column": "wintpk",
+    },
+    "summer_min_am": {
+        "label": "Summer Min AM",
+        "active_column": "DemandAM",
+        "lv_gain_column": "SummerAM",
+        "storage_column": "summam",
+    },
+    "summer_min_pm": {
+        "label": "Summer Min PM",
+        "active_column": "DemandPM",
+        "lv_gain_column": "SummerPM",
+        "storage_column": "summpm",
+    },
+}
+FES_CONTRIBUTION_SHEETS = {
+    "LV Gain": {
+        "scenario_column": "Scenario",
+        "year_column": "Year",
+        "value_columns": {
+            "winter_peak": "Peak",
+            "summer_min_am": "SummerAM",
+            "summer_min_pm": "SummerPM",
+        },
+    },
+    "mBattery": {
+        "scenario_column": "scenario",
+        "year_column": "year",
+        "value_columns": {
+            "winter_peak": "wintpk",
+            "summer_min_am": "summam",
+            "summer_min_pm": "summpm",
+        },
+    },
+    "DxStorage": {
+        "scenario_column": "scenario",
+        "year_column": "year",
+        "value_columns": {
+            "winter_peak": "wintpk",
+            "summer_min_am": "summam",
+            "summer_min_pm": "summpm",
+        },
+    },
+}
 
 
 def read_excel_file():
@@ -270,6 +321,177 @@ def prompt_select_year(df: pd.DataFrame) -> tuple[pd.DataFrame, int]:
         print(f"Please enter a number between 1 and {len(unique_years)}.")
 
 
+def prompt_select_fes_scenario(active_df: pd.DataFrame) -> tuple[pd.DataFrame, str]:
+    if "scenario" not in active_df.columns:
+        raise KeyError("The Active dataframe does not contain a 'scenario' column.")
+
+    unique_scenarios = sorted(active_df["scenario"].dropna().astype(str).unique())
+    if not unique_scenarios:
+        raise ValueError("No scenario values were found in the filtered Active dataframe.")
+
+    print("\nAvailable FES scenarios:")
+    for index, scenario in enumerate(unique_scenarios, start=1):
+        print(f"{index}. {scenario}")
+
+    while True:
+        selection = input("Enter the number of the FES scenario to use for scaling: ").strip()
+        if not selection.isdigit():
+            print("Please enter a valid number.")
+            continue
+
+        selection_index = int(selection)
+        if 1 <= selection_index <= len(unique_scenarios):
+            selected_scenario = unique_scenarios[selection_index - 1]
+            scenario_df = active_df[active_df["scenario"].astype(str) == selected_scenario].reset_index(drop=True)
+            print(f"Selected FES scenario '{selected_scenario}' with {len(scenario_df)} Active rows.")
+            return scenario_df, selected_scenario
+
+        print(f"Please enter a number between 1 and {len(unique_scenarios)}.")
+
+
+def prompt_select_fes_year(active_df: pd.DataFrame) -> tuple[pd.DataFrame, int]:
+    if "year" not in active_df.columns:
+        raise KeyError("The Active dataframe does not contain a 'year' column.")
+
+    unique_years = sorted(active_df["year"].dropna().unique())
+    if not unique_years:
+        raise ValueError("No year values were found in the filtered Active dataframe.")
+
+    print("\nAvailable FES years:")
+    for index, year in enumerate(unique_years, start=1):
+        print(f"{index}. {int(year)}")
+
+    while True:
+        selection = input("Enter the number of the FES year to use for scaling: ").strip()
+        if not selection.isdigit():
+            print("Please enter a valid number.")
+            continue
+
+        selection_index = int(selection)
+        if 1 <= selection_index <= len(unique_years):
+            selected_year = unique_years[selection_index - 1]
+            year_df = active_df[active_df["year"] == selected_year].reset_index(drop=True)
+            selected_year = int(selected_year)
+            print(f"Selected FES year {selected_year} with {len(year_df)} Active rows.")
+            return year_df, selected_year
+
+        print(f"Please enter a number between 1 and {len(unique_years)}.")
+
+
+def calculate_active_demand_totals(active_df: pd.DataFrame) -> dict:
+    missing_columns = sorted(ACTIVE_REQUIRED_COLUMNS - set(active_df.columns))
+    if missing_columns:
+        raise KeyError(f"The Active dataframe is missing required columns: {missing_columns}")
+
+    if active_df.empty:
+        raise ValueError("No Active rows were found for the selected GSP, FES scenario, and FES year.")
+
+    demand_values = active_df[ACTIVE_DEMAND_COLUMNS].apply(pd.to_numeric, errors="coerce")
+    if demand_values.isna().any().any():
+        null_columns = demand_values.columns[demand_values.isna().any()].tolist()
+        raise ValueError(f"The Active dataframe contains non-numeric demand values in: {null_columns}")
+
+    totals = demand_values.sum()
+    return {column: float(totals[column]) for column in ACTIVE_DEMAND_COLUMNS}
+
+
+def calculate_fes_sheet_contributions(
+    sheet_name: str,
+    df: pd.DataFrame,
+    scenario: str,
+    year: int,
+) -> dict:
+    if sheet_name not in FES_CONTRIBUTION_SHEETS:
+        raise KeyError(f"No FES contribution mapping has been configured for sheet '{sheet_name}'.")
+
+    config = FES_CONTRIBUTION_SHEETS[sheet_name]
+    required_columns = {
+        config["scenario_column"],
+        config["year_column"],
+        *config["value_columns"].values(),
+    }
+    missing_columns = sorted(required_columns - set(df.columns))
+    if missing_columns:
+        raise KeyError(f"The {sheet_name} dataframe is missing required columns: {missing_columns}")
+
+    year_values = pd.to_numeric(df[config["year_column"]], errors="coerce")
+    matching_rows = df[
+        (df[config["scenario_column"]].astype(str) == str(scenario))
+        & (year_values == int(year))
+    ].reset_index(drop=True)
+
+    if matching_rows.empty:
+        print(f"No {sheet_name} rows found for scenario '{scenario}', FES year {year}; using 0 contribution.")
+        return {
+            setpoint_key: {
+                "value": 0.0,
+                "row_count": 0,
+                "source_column": source_column,
+            }
+            for setpoint_key, source_column in config["value_columns"].items()
+        }
+
+    contributions = {}
+    for setpoint_key, source_column in config["value_columns"].items():
+        values = pd.to_numeric(matching_rows[source_column], errors="coerce")
+        if values.isna().any():
+            raise ValueError(f"The {sheet_name} dataframe contains non-numeric values in '{source_column}'.")
+
+        contributions[setpoint_key] = {
+            "value": float(values.sum()),
+            "row_count": len(matching_rows),
+            "source_column": source_column,
+        }
+
+    return contributions
+
+
+def calculate_gross_demand_setpoints(
+    filtered_excel_data: dict,
+    active_demand_totals: dict,
+    scenario: str,
+    year: int,
+) -> dict:
+    gross_setpoints = {}
+    sheet_contributions = {}
+
+    for sheet_name in FES_CONTRIBUTION_SHEETS:
+        sheet_df = filtered_excel_data.get(sheet_name)
+        if sheet_df is None:
+            raise KeyError(f"The {sheet_name} sheet was not loaded or filtered.")
+
+        sheet_contributions[sheet_name] = calculate_fes_sheet_contributions(
+            sheet_name,
+            sheet_df,
+            scenario,
+            year,
+        )
+
+    for setpoint_key, setpoint_config in GROSS_DEMAND_SETPOINTS.items():
+        active_value = float(active_demand_totals[setpoint_config["active_column"]])
+        components = {"Active": active_value}
+
+        for sheet_name in FES_CONTRIBUTION_SHEETS:
+            components[sheet_name] = sheet_contributions[sheet_name][setpoint_key]["value"]
+
+        gross_setpoints[setpoint_key] = {
+            "label": setpoint_config["label"],
+            "components": components,
+            "gross_demand": float(sum(components.values())),
+        }
+
+    return gross_setpoints
+
+
+def print_gross_demand_setpoints(gross_demand_setpoints: dict) -> None:
+    print("\nGross demand setpoints:")
+    for setpoint_key in GROSS_DEMAND_SETPOINTS:
+        setpoint = gross_demand_setpoints[setpoint_key]
+        print(f"  {setpoint['label']}: {setpoint['gross_demand']:,.6f}")
+        for component_name, value in setpoint["components"].items():
+            print(f"    {component_name}: {value:,.6f}")
+
+
 def fill_missing_periods(df: pd.DataFrame, year: int) -> pd.DataFrame:
     if not isinstance(df.index, pd.DatetimeIndex):
         raise TypeError("The dataframe index must be a DatetimeIndex.")
@@ -314,7 +536,12 @@ def prepare_processing_data(excel_data: dict, csv_data: pd.DataFrame) -> dict:
     Returns:
         Dictionary containing:
             - 'elexon_id': The selected Elexon ID (GSP Id)
-            - 'year': The selected year
+            - 'year': The selected CSV source year
+            - 'csv_year': The selected CSV source year
+            - 'fes_scenario': The selected Regional FES scenario
+            - 'fes_year': The selected Regional FES target year
+            - 'active_demand_totals': Active DemandPk/DemandAM/DemandPM totals for scaling
+            - 'gross_demand_setpoints': Gross demand setpoints with Active/LV Gain/storage components
             - 'csv_profile': The processed CSV data with datetime index, filtered to year
             - 'main_data': The filtered MAIN DATA row(s) for the selected Elexon ID
             - 'gsp_info': The complete GSP info sheet (for reference/lookup)
@@ -334,36 +561,79 @@ def prepare_processing_data(excel_data: dict, csv_data: pd.DataFrame) -> dict:
     filtered_excel_data = filter_data_by_elexon_id(excel_data, selected_elexon_id)
     
     # Step 3: Create datetime index and filter by year
-    print("\nStep 3: Processing CSV data (datetime index and year selection)")
+    print("\nStep 3: Processing CSV data (datetime index and source year selection)")
     csv_filtered = create_datetime_index(csv_filtered)
-    csv_filtered, selected_year = prompt_select_year(csv_filtered)
+    csv_filtered, selected_csv_year = prompt_select_year(csv_filtered)
     
     # Step 4: Fill missing periods
     print("\nStep 4: Filling missing periods")
-    csv_filtered = fill_missing_periods(csv_filtered, selected_year)
+    csv_filtered = fill_missing_periods(csv_filtered, selected_csv_year)
+
+    # Step 5: Select Regional FES scenario/year and calculate Active demand totals
+    print("\nStep 5: Selecting Regional FES scenario/year and calculating Active demand totals")
+    active_data = filtered_excel_data.get("Active")
+    if active_data is None:
+        raise KeyError("The Active sheet was not loaded or filtered.")
+    if active_data.empty:
+        raise ValueError(f"No Active rows were found for selected GSP '{selected_elexon_id}'.")
+
+    missing_active_columns = sorted(ACTIVE_REQUIRED_COLUMNS - set(active_data.columns))
+    if missing_active_columns:
+        raise KeyError(f"The Active dataframe is missing required columns: {missing_active_columns}")
+
+    active_scenario_data, selected_fes_scenario = prompt_select_fes_scenario(active_data)
+    active_year_data, selected_fes_year = prompt_select_fes_year(active_scenario_data)
+    active_demand_totals = calculate_active_demand_totals(active_year_data)
+    gross_demand_setpoints = calculate_gross_demand_setpoints(
+        filtered_excel_data,
+        active_demand_totals,
+        selected_fes_scenario,
+        selected_fes_year,
+    )
     
     # Assemble processing package
     processing_data = {
         'elexon_id': selected_elexon_id,
-        'year': selected_year,
+        'year': selected_csv_year,
+        'csv_year': selected_csv_year,
+        'fes_scenario': selected_fes_scenario,
+        'fes_year': selected_fes_year,
+        'active_demand_totals': active_demand_totals,
+        'gross_demand_setpoints': gross_demand_setpoints,
         'csv_profile': csv_filtered,
         'main_data': filtered_excel_data.get('MAIN DATA'),
         'dg_data': filtered_excel_data.get('DG'),
         'sub1mw_data': filtered_excel_data.get('Sub1MW'),
+        'dxstorage_data': filtered_excel_data.get('DxStorage'),
+        'mbattery_data': filtered_excel_data.get('mBattery'),
+        'lv_gain_data': filtered_excel_data.get('LV Gain'),
+        'active_data': active_year_data,
         'gsp_info': filtered_excel_data.get('GSP info'),
     }
     
     print("\n" + "="*80)
     print("PROCESSING DATA READY")
     print(f"Elexon ID: {selected_elexon_id}")
-    print(f"Year: {selected_year}")
+    print(f"CSV source year: {selected_csv_year}")
+    print(f"FES scenario: {selected_fes_scenario}")
+    print(f"FES target year: {selected_fes_year}")
     print(f"CSV Profile shape: {processing_data['csv_profile'].shape}")
+    print("Active demand totals for scaling:")
+    for column in ACTIVE_DEMAND_COLUMNS:
+        print(f"  {column}: {active_demand_totals[column]:,.6f}")
+    print_gross_demand_setpoints(gross_demand_setpoints)
     if processing_data['main_data'] is not None and len(processing_data['main_data']) > 0:
         print(f"MAIN DATA shape: {processing_data['main_data'].shape}")
     if processing_data['dg_data'] is not None and len(processing_data['dg_data']) > 0:
         print(f"DG shape: {processing_data['dg_data'].shape}")
     if processing_data['sub1mw_data'] is not None and len(processing_data['sub1mw_data']) > 0:
         print(f"Sub1MW shape: {processing_data['sub1mw_data'].shape}")
+    if processing_data['dxstorage_data'] is not None and len(processing_data['dxstorage_data']) > 0:
+        print(f"DxStorage shape: {processing_data['dxstorage_data'].shape}")
+    if processing_data['mbattery_data'] is not None and len(processing_data['mbattery_data']) > 0:
+        print(f"mBattery shape: {processing_data['mbattery_data'].shape}")
+    if processing_data['lv_gain_data'] is not None and len(processing_data['lv_gain_data']) > 0:
+        print(f"LV Gain shape: {processing_data['lv_gain_data'].shape}")
     print("="*80 + "\n")
     
     return processing_data
@@ -516,6 +786,10 @@ if __name__ == "__main__":
         main_data = processing_data['main_data']
         elexon_id = processing_data['elexon_id']
         year = processing_data['year']
+        fes_scenario = processing_data['fes_scenario']
+        fes_year = processing_data['fes_year']
+        active_demand_totals = processing_data['active_demand_totals']
+        gross_demand_setpoints = processing_data['gross_demand_setpoints']
         
         # Save CSV profile
         csv_profile.to_csv("filtered_gp9_data.csv")
@@ -525,11 +799,19 @@ if __name__ == "__main__":
         # Display MAIN DATA if available
         if main_data is not None:
             print(f"\nMAIN DATA for Elexon ID {elexon_id}:\n{main_data}")
+
+        print(f"\nActive demand totals for FES scenario {fes_scenario}, FES year {fes_year}:")
+        for column in ACTIVE_DEMAND_COLUMNS:
+            print(f"  {column}: {active_demand_totals[column]:,.6f}")
+
+        print_gross_demand_setpoints(gross_demand_setpoints)
         
         print(f"\n✓ Data preparation complete and ready for profile transformation")
         print(f"  - Use 'processing_data' dict to access all excel and csv data")
         print(f"  - processing_data['csv_profile']: Contains the profile data with set points")
         print(f"  - processing_data['main_data']: Contains the max/min set points from excel")
+        print(f"  - processing_data['active_demand_totals']: Contains Active DemandPk/DemandAM/DemandPM totals")
+        print(f"  - processing_data['gross_demand_setpoints']: Contains the three gross demand setpoints")
         
         # Plot the selected data
         print(f"\n{'='*80}")
