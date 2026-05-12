@@ -26,7 +26,11 @@ def read_excel_file():
             "GSP info": {"usecols": "B:G", "skiprows": 4, "nrows": 376},
             "MAIN DATA": {"usecols": "A:N", "skiprows": 14, "nrows": 539},
             "DG": {"usecols": "A:H", "skiprows": 2, "nrows": 71158},
-            "Sub1MW": {"usecols": "A:H", "skiprows": 2, "nrows": 152181}
+            "Sub1MW": {"usecols": "A:H", "skiprows": 2, "nrows": 152181},
+            "DxStorage": {"usecols": "A:H", "skiprows": 2, "nrows": 12786},
+            "mBattery": {"usecols": "A:H", "skiprows": 2, "nrows": 30420},
+            "LV Gain": {"usecols": "A:H", "skiprows": 2, "nrows": 310388},
+            "Active": {"usecols": "A:H", "skiprows": 2, "nrows": 225828},
         }
         all_sheets_data = {}
 
@@ -155,11 +159,51 @@ def filter_data_by_elexon_id(excel_data: dict, elexon_id: str) -> dict:
         else:
             print(f"Warning: 'etys_location' column not found in Sub1MW. Available columns: {list(sub1mw_df.columns)}")
             filtered_data["Sub1MW"] = pd.DataFrame()
-    
+
+    if "DxStorage" in excel_data:
+        dxstorage_df = excel_data["DxStorage"]
+        if "location" in dxstorage_df.columns:
+            filtered_dxstorage = dxstorage_df[dxstorage_df["location"].astype(str) == str(elexon_id)].reset_index(drop=True)
+            filtered_data["DxStorage"] = filtered_dxstorage
+            print(f"Filtered DxStorage to location '{elexon_id}': {len(filtered_dxstorage)} rows")
+        else:
+            print(f"Warning: 'location' column not found in DxStorage. Available columns: {list(dxstorage_df.columns)}")
+            filtered_data["DxStorage"] = pd.DataFrame()
+
+    if "mBattery" in excel_data:
+        mbattery_df = excel_data["mBattery"]
+        if "etys_location" in mbattery_df.columns:
+            filtered_mbattery = mbattery_df[mbattery_df["etys_location"].astype(str) == str(elexon_id)].reset_index(drop=True)
+            filtered_data["mBattery"] = filtered_mbattery
+            print(f"Filtered mBattery to etys_location '{elexon_id}': {len(filtered_mbattery)} rows")
+        else:
+            print(f"Warning: 'etys_location' column not found in mBattery. Available columns: {list(mbattery_df.columns)}")
+            filtered_data["mBattery"] = pd.DataFrame()
+
+    if "LV Gain" in excel_data:
+        lv_gain_df = excel_data["LV Gain"]
+        if "GSP" in lv_gain_df.columns:
+            filtered_lv_gain = lv_gain_df[lv_gain_df["GSP"].astype(str) == str(elexon_id)].reset_index(drop=True)
+            filtered_data["LV Gain"] = filtered_lv_gain
+            print(f"Filtered LV Gain to GSP '{elexon_id}': {len(filtered_lv_gain)} rows")
+        else:
+            print(f"Warning: 'GSP' column not found in LV Gain. Available columns: {list(lv_gain_df.columns)}")
+            filtered_data["LV Gain"] = pd.DataFrame()
+
+    if "Active" in excel_data:
+        active_df = excel_data["Active"]
+        if "GSP" in active_df.columns:
+            filtered_active = active_df[active_df["GSP"].astype(str) == str(elexon_id)].reset_index(drop=True)
+            filtered_data["Active"] = filtered_active
+            print(f"Filtered Active to GSP '{elexon_id}': {len(filtered_active)} rows")
+        else:
+            print(f"Warning: 'GSP' column not found in Active. Available columns: {list(active_df.columns)}")
+            filtered_data["Active"] = pd.DataFrame()    
+
     # Keep GSP info unfiltered (reference data)
     if "GSP info" in excel_data:
         filtered_data["GSP info"] = excel_data["GSP info"]
-    
+
     return filtered_data
 
 
