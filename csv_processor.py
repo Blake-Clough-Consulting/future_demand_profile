@@ -13,32 +13,20 @@ GROSS_DEMAND_SETPOINTS = {
     "winter_peak": {
         "label": "Winter Peak",
         "active_column": "DemandPk",
-        "lv_gain_column": "Peak",
         "storage_column": "wintpk",
     },
     "summer_min_am": {
         "label": "Summer Min AM",
         "active_column": "DemandAM",
-        "lv_gain_column": "SummerAM",
         "storage_column": "summam",
     },
     "summer_min_pm": {
         "label": "Summer Min PM",
         "active_column": "DemandPM",
-        "lv_gain_column": "SummerPM",
         "storage_column": "summpm",
     },
 }
 FES_CONTRIBUTION_SHEETS = {
-    "LV Gain": {
-        "scenario_column": "Scenario",
-        "year_column": "Year",
-        "value_columns": {
-            "winter_peak": "Peak",
-            "summer_min_am": "SummerAM",
-            "summer_min_pm": "SummerPM",
-        },
-    },
     "mBattery": {
         "scenario_column": "scenario",
         "year_column": "year",
@@ -541,7 +529,7 @@ def prepare_processing_data(excel_data: dict, csv_data: pd.DataFrame) -> dict:
             - 'fes_scenario': The selected Regional FES scenario
             - 'fes_year': The selected Regional FES target year
             - 'active_demand_totals': Active DemandPk/DemandAM/DemandPM totals for scaling
-            - 'gross_demand_setpoints': Gross demand setpoints with Active/LV Gain/storage components
+            - 'gross_demand_setpoints': Gross demand setpoints with Active and storage components
             - 'csv_profile': The processed CSV data with datetime index, filtered to year
             - 'main_data': The filtered MAIN DATA row(s) for the selected Elexon ID
             - 'gsp_info': The complete GSP info sheet (for reference/lookup)
