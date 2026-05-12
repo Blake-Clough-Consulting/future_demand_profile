@@ -7,6 +7,8 @@ import matplotlib.dates as mdates  # type: ignore
 from datetime import timedelta
 
 FILENAME_PATTERN = re.compile(r"^GP9_2023(\d{2})\.csv$")
+SOURCE_PROFILE_COLUMN = "Meter Volume"
+DERIVED_PROFILE_COLUMN = "Derived Net Demand"
 ACTIVE_REQUIRED_COLUMNS = {"scenario", "year", "DemandPk", "DemandAM", "DemandPM", "type"}
 ACTIVE_DEMAND_COLUMNS = ["DemandPk", "DemandAM", "DemandPM"]
 DEMAND_SETPOINTS = {
@@ -27,7 +29,6 @@ FES_CONTRIBUTION_SHEETS = {
     "mBattery": {
         "scenario_column": "scenario",
         "year_column": "year",
-        "sign": 1,
         "value_columns": {
             "winter_peak": "wintpk",
             "summer_min_am": "summam",
@@ -37,7 +38,6 @@ FES_CONTRIBUTION_SHEETS = {
     "DxStorage": {
         "scenario_column": "scenario",
         "year_column": "year",
-        "sign": 1,
         "value_columns": {
             "winter_peak": "wintpk",
             "summer_min_am": "summam",
@@ -47,7 +47,6 @@ FES_CONTRIBUTION_SHEETS = {
     "DG": {
         "scenario_column": "scenario",
         "year_column": "year",
-        "sign": -1,
         "value_columns": {
             "winter_peak": "wintpk",
             "summer_min_am": "summam",
@@ -57,7 +56,6 @@ FES_CONTRIBUTION_SHEETS = {
     "Sub1MW": {
         "scenario_column": "scenario",
         "year_column": "year",
-        "sign": -1,
         "value_columns": {
             "winter_peak": "wintpk",
             "summer_min_am": "summam",
@@ -490,17 +488,20 @@ def calculate_net_demand_setpoints(
 
     for setpoint_key, setpoint_config in DEMAND_SETPOINTS.items():
         gross_demand = float(gross_demand_setpoints[setpoint_key]["gross_demand"])
-        components = {"Gross demand (Active)": gross_demand}
+        worksheet_values = {}
 
         for sheet_name in FES_CONTRIBUTION_SHEETS:
             raw_value = sheet_contributions[sheet_name][setpoint_key]["value"]
-            signed_value = raw_value * FES_CONTRIBUTION_SHEETS[sheet_name]["sign"]
-            components[sheet_name] = float(signed_value)
+            worksheet_values[sheet_name] = float(raw_value)
+
+        worksheet_total = float(sum(worksheet_values.values()))
 
         net_setpoints[setpoint_key] = {
             "label": setpoint_config["label"],
-            "components": components,
-            "net_demand": float(sum(components.values())),
+            "gross_demand": gross_demand,
+            "worksheet_values": worksheet_values,
+            "worksheet_total": worksheet_total,
+            "net_demand": gross_demand - worksheet_total,
         }
 
     return net_setpoints
@@ -520,8 +521,76 @@ def print_net_demand_setpoints(net_demand_setpoints: dict) -> None:
     for setpoint_key in DEMAND_SETPOINTS:
         setpoint = net_demand_setpoints[setpoint_key]
         print(f"  {setpoint['label']}: {setpoint['net_demand']:,.6f}")
-        for component_name, value in setpoint["components"].items():
-            print(f"    {component_name}: {value:,.6f}")
+        print(f"    Gross demand (Active): {setpoint['gross_demand']:,.6f}")
+        print("    Subtracted worksheet values:")
+        for component_name, value in setpoint["worksheet_values"].items():
+            print(f"      {component_name}: {value:,.6f}")
+        print(f"    Worksheet total subtracted: {setpoint['worksheet_total']:,.6f}")
+
+
+def scale_profile_to_net_demand_setpoints(
+    csv_profile: pd.DataFrame,
+    net_demand_setpoints: dict,
+) -> tuple[pd.DataFrame, dict]:
+    if SOURCE_PROFILE_COLUMN not in csv_profile.columns:
+        raise KeyError(f"The CSV profile does not contain a '{SOURCE_PROFILE_COLUMN}' column.")
+
+    source_profile = pd.to_numeric(csv_profile[SOURCE_PROFILE_COLUMN], errors="coerce")
+    if source_profile.isna().any():
+        raise ValueError(f"The '{SOURCE_PROFILE_COLUMN}' column contains non-numeric or missing values.")
+
+    source_min = float(source_profile.min())
+    source_max = float(source_profile.max())
+    if source_min == source_max:
+        raise ValueError("Cannot scale the selected profile because its source min and max are equal.")
+
+    target_ceiling = float(net_demand_setpoints["winter_peak"]["net_demand"])
+    summer_min_am = float(net_demand_setpoints["summer_min_am"]["net_demand"])
+    summer_min_pm = float(net_demand_setpoints["summer_min_pm"]["net_demand"])
+    if summer_min_am <= summer_min_pm:
+        target_floor = summer_min_am
+        floor_setpoint = net_demand_setpoints["summer_min_am"]["label"]
+    else:
+        target_floor = summer_min_pm
+        floor_setpoint = net_demand_setpoints["summer_min_pm"]["label"]
+
+    if target_ceiling <= target_floor:
+        raise ValueError(
+            f"Cannot scale profile because target ceiling ({target_ceiling:,.6f}) "
+            f"is not greater than target floor ({target_floor:,.6f})."
+        )
+
+    derived_values = target_floor + (
+        (source_profile - source_min) * (target_ceiling - target_floor) / (source_max - source_min)
+    )
+
+    derived_profile = csv_profile.copy()
+    derived_profile[DERIVED_PROFILE_COLUMN] = derived_values
+
+    scaling_summary = {
+        "source_min": source_min,
+        "source_max": source_max,
+        "target_floor": target_floor,
+        "target_ceiling": target_ceiling,
+        "floor_setpoint": floor_setpoint,
+        "derived_min": float(derived_values.min()),
+        "derived_max": float(derived_values.max()),
+    }
+
+    return derived_profile, scaling_summary
+
+
+def print_profile_scaling_summary(profile_scaling_summary: dict) -> None:
+    print("\nProfile scaling summary:")
+    print(f"  Source min: {profile_scaling_summary['source_min']:,.6f}")
+    print(f"  Source max: {profile_scaling_summary['source_max']:,.6f}")
+    print(
+        f"  Target floor: {profile_scaling_summary['target_floor']:,.6f} "
+        f"({profile_scaling_summary['floor_setpoint']})"
+    )
+    print(f"  Target ceiling: {profile_scaling_summary['target_ceiling']:,.6f} (Winter Peak)")
+    print(f"  Derived min: {profile_scaling_summary['derived_min']:,.6f}")
+    print(f"  Derived max: {profile_scaling_summary['derived_max']:,.6f}")
 
 
 def fill_missing_periods(df: pd.DataFrame, year: int) -> pd.DataFrame:
@@ -575,6 +644,8 @@ def prepare_processing_data(excel_data: dict, csv_data: pd.DataFrame) -> dict:
             - 'active_demand_totals': Active DemandPk/DemandAM/DemandPM totals for scaling
             - 'gross_demand_setpoints': Gross demand setpoints from Active only
             - 'net_demand_setpoints': Net demand setpoints after storage and generation adjustments
+            - 'derived_profile': CSV profile plus the in-memory derived net demand column
+            - 'profile_scaling_summary': Source/target min-max scaling details
             - 'csv_profile': The processed CSV data with datetime index, filtered to year
             - 'main_data': The filtered MAIN DATA row(s) for the selected Elexon ID
             - 'gsp_info': The complete GSP info sheet (for reference/lookup)
@@ -624,6 +695,10 @@ def prepare_processing_data(excel_data: dict, csv_data: pd.DataFrame) -> dict:
         selected_fes_scenario,
         selected_fes_year,
     )
+    derived_profile, profile_scaling_summary = scale_profile_to_net_demand_setpoints(
+        csv_filtered,
+        net_demand_setpoints,
+    )
     
     # Assemble processing package
     processing_data = {
@@ -635,6 +710,8 @@ def prepare_processing_data(excel_data: dict, csv_data: pd.DataFrame) -> dict:
         'active_demand_totals': active_demand_totals,
         'gross_demand_setpoints': gross_demand_setpoints,
         'net_demand_setpoints': net_demand_setpoints,
+        'derived_profile': derived_profile,
+        'profile_scaling_summary': profile_scaling_summary,
         'csv_profile': csv_filtered,
         'main_data': filtered_excel_data.get('MAIN DATA'),
         'dg_data': filtered_excel_data.get('DG'),
@@ -658,6 +735,7 @@ def prepare_processing_data(excel_data: dict, csv_data: pd.DataFrame) -> dict:
         print(f"  {column}: {active_demand_totals[column]:,.6f}")
     print_gross_demand_setpoints(gross_demand_setpoints)
     print_net_demand_setpoints(net_demand_setpoints)
+    print_profile_scaling_summary(profile_scaling_summary)
     if processing_data['main_data'] is not None and len(processing_data['main_data']) > 0:
         print(f"MAIN DATA shape: {processing_data['main_data'].shape}")
     if processing_data['dg_data'] is not None and len(processing_data['dg_data']) > 0:
@@ -675,7 +753,13 @@ def prepare_processing_data(excel_data: dict, csv_data: pd.DataFrame) -> dict:
     return processing_data
 
 
-def plot_one_day_profile(df: pd.DataFrame, elexon_id: str, year: int) -> None:
+def plot_one_day_profile(
+    df: pd.DataFrame,
+    elexon_id: str,
+    year: int,
+    fes_scenario: str | None = None,
+    fes_year: int | None = None,
+) -> None:
     """
     Plot one day of data at half-hourly resolution.
     Prompts user to select which day to plot.
@@ -684,6 +768,8 @@ def plot_one_day_profile(df: pd.DataFrame, elexon_id: str, year: int) -> None:
         df: Dataframe with DatetimeIndex and data columns
         elexon_id: The selected Elexon ID (for plot title)
         year: The selected year (for plot title)
+        fes_scenario: The selected FES scenario, if a derived profile is shown
+        fes_year: The selected FES year, if a derived profile is shown
     """
     if not isinstance(df.index, pd.DatetimeIndex):
         raise TypeError("The dataframe index must be a DatetimeIndex.")
@@ -732,15 +818,36 @@ def plot_one_day_profile(df: pd.DataFrame, elexon_id: str, year: int) -> None:
             # Create plot
             fig, ax = plt.subplots(figsize=(14, 6))
             
-            # Plot Meter Volume column
-            if "Meter Volume" in day_data.columns:
-                ax.plot(day_data.index, day_data["Meter Volume"], marker='o', label="Meter Volume", linewidth=2, markersize=4)
+            # Plot original and derived profile columns
+            if SOURCE_PROFILE_COLUMN in day_data.columns:
+                ax.plot(
+                    day_data.index,
+                    day_data[SOURCE_PROFILE_COLUMN],
+                    marker='o',
+                    label=SOURCE_PROFILE_COLUMN,
+                    linewidth=2,
+                    markersize=4,
+                )
                 ax.set_xlabel("Time (Half-hourly)", fontsize=12)
-                ax.set_ylabel("Meter Volume", fontsize=12)
+                ax.set_ylabel("Demand", fontsize=12)
             else:
-                print(f"Column 'Meter Volume' not found. Available columns: {list(day_data.columns)}")
+                print(f"Column '{SOURCE_PROFILE_COLUMN}' not found. Available columns: {list(day_data.columns)}")
                 continue
-            ax.set_title(f"Daily Profile - {selected_date}\nElexon ID: {elexon_id}, Year: {year}", fontsize=14, fontweight='bold')
+
+            if DERIVED_PROFILE_COLUMN in day_data.columns:
+                ax.plot(
+                    day_data.index,
+                    day_data[DERIVED_PROFILE_COLUMN],
+                    marker='x',
+                    label=f"{DERIVED_PROFILE_COLUMN} (scaled to net setpoints)",
+                    linewidth=2,
+                    markersize=4,
+                )
+
+            title = f"Daily Profile - {selected_date}\nElexon ID: {elexon_id}, CSV Year: {year}"
+            if fes_scenario is not None and fes_year is not None and DERIVED_PROFILE_COLUMN in day_data.columns:
+                title += f", FES: {fes_scenario} {fes_year}"
+            ax.set_title(title, fontsize=14, fontweight='bold')
             ax.grid(True, alpha=0.3)
             ax.legend(loc='best')
             ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
@@ -753,7 +860,14 @@ def plot_one_day_profile(df: pd.DataFrame, elexon_id: str, year: int) -> None:
         print(f"Please enter a number between 1 and {len(unique_dates)}.")
 
 
-def plot_yearly_rolling_average(df: pd.DataFrame, elexon_id: str, year: int, window_days: int = 3) -> None:
+def plot_yearly_rolling_average(
+    df: pd.DataFrame,
+    elexon_id: str,
+    year: int,
+    fes_scenario: str | None = None,
+    fes_year: int | None = None,
+    window_days: int = 3,
+) -> None:
     """
     Plot the entire year with a rolling average.
     
@@ -761,6 +875,8 @@ def plot_yearly_rolling_average(df: pd.DataFrame, elexon_id: str, year: int, win
         df: Dataframe with DatetimeIndex and data columns
         elexon_id: The selected Elexon ID (for plot title)
         year: The selected year (for plot title)
+        fes_scenario: The selected FES scenario, if a derived profile is shown
+        fes_year: The selected FES year, if a derived profile is shown
         window_days: Number of days for rolling average (default 3)
     """
     if not isinstance(df.index, pd.DatetimeIndex):
@@ -770,25 +886,42 @@ def plot_yearly_rolling_average(df: pd.DataFrame, elexon_id: str, year: int, win
     print(f"PLOT YEARLY DATA - {window_days}-DAY ROLLING AVERAGE")
     print(f"{'='*80}")
     
-    # Check if Meter Volume column exists
-    if "Meter Volume" not in df.columns:
-        print(f"Column 'Meter Volume' not found. Available columns: {list(df.columns)}")
+    # Check if original profile column exists
+    if SOURCE_PROFILE_COLUMN not in df.columns:
+        print(f"Column '{SOURCE_PROFILE_COLUMN}' not found. Available columns: {list(df.columns)}")
         return
     
     # Calculate rolling average (window in hours: days * 48 half-hourly periods)
     window_periods = window_days * 48
-    df_rolling = df[["Meter Volume"]].rolling(window=window_periods, center=True, min_periods=1).mean()
+    plot_columns = [SOURCE_PROFILE_COLUMN]
+    if DERIVED_PROFILE_COLUMN in df.columns:
+        plot_columns.append(DERIVED_PROFILE_COLUMN)
+    df_rolling = df[plot_columns].rolling(window=window_periods, center=True, min_periods=1).mean()
     
     # Create plot
     fig, ax = plt.subplots(figsize=(16, 7))
     
     # Plot rolling average
-    ax.plot(df_rolling.index, df_rolling["Meter Volume"], label=f"Meter Volume ({window_days}-day MA)", linewidth=2)
+    ax.plot(
+        df_rolling.index,
+        df_rolling[SOURCE_PROFILE_COLUMN],
+        label=f"{SOURCE_PROFILE_COLUMN} ({window_days}-day MA)",
+        linewidth=2,
+    )
+    if DERIVED_PROFILE_COLUMN in df_rolling.columns:
+        ax.plot(
+            df_rolling.index,
+            df_rolling[DERIVED_PROFILE_COLUMN],
+            label=f"{DERIVED_PROFILE_COLUMN} ({window_days}-day MA, scaled to net setpoints)",
+            linewidth=2,
+        )
     
     ax.set_xlabel("Date", fontsize=12)
-    ax.set_ylabel(f"Meter Volume ({window_days}-day Rolling Average)", fontsize=12)
-    ax.set_title(f"Yearly Profile with {window_days}-Day Rolling Average\nElexon ID: {elexon_id}, Year: {year}", 
-                 fontsize=14, fontweight='bold')
+    ax.set_ylabel(f"Demand ({window_days}-day Rolling Average)", fontsize=12)
+    title = f"Yearly Profile with {window_days}-Day Rolling Average\nElexon ID: {elexon_id}, CSV Year: {year}"
+    if fes_scenario is not None and fes_year is not None and DERIVED_PROFILE_COLUMN in df_rolling.columns:
+        title += f", FES: {fes_scenario} {fes_year}"
+    ax.set_title(title, fontsize=14, fontweight='bold')
     ax.grid(True, alpha=0.3)
     ax.legend(loc='best')
     ax.xaxis.set_major_locator(mdates.MonthLocator())
@@ -819,6 +952,7 @@ if __name__ == "__main__":
         
         # Extract components for easier access
         csv_profile = processing_data['csv_profile']
+        derived_profile = processing_data['derived_profile']
         main_data = processing_data['main_data']
         elexon_id = processing_data['elexon_id']
         year = processing_data['year']
@@ -827,6 +961,7 @@ if __name__ == "__main__":
         active_demand_totals = processing_data['active_demand_totals']
         gross_demand_setpoints = processing_data['gross_demand_setpoints']
         net_demand_setpoints = processing_data['net_demand_setpoints']
+        profile_scaling_summary = processing_data['profile_scaling_summary']
         
         # Save CSV profile
         csv_profile.to_csv("filtered_gp9_data.csv")
@@ -843,6 +978,7 @@ if __name__ == "__main__":
 
         print_gross_demand_setpoints(gross_demand_setpoints)
         print_net_demand_setpoints(net_demand_setpoints)
+        print_profile_scaling_summary(profile_scaling_summary)
         
         print(f"\n✓ Data preparation complete and ready for profile transformation")
         print(f"  - Use 'processing_data' dict to access all excel and csv data")
@@ -851,12 +987,13 @@ if __name__ == "__main__":
         print(f"  - processing_data['active_demand_totals']: Contains Active DemandPk/DemandAM/DemandPM totals")
         print(f"  - processing_data['gross_demand_setpoints']: Contains Active-only gross demand setpoints")
         print(f"  - processing_data['net_demand_setpoints']: Contains the final net demand setpoints")
+        print(f"  - processing_data['derived_profile']: Contains the in-memory derived net demand profile")
         
         # Plot the selected data
         print(f"\n{'='*80}")
         print("VISUALIZATION")
         print(f"{'='*80}")
         
-        plot_one_day_profile(csv_profile, elexon_id, year)
-        plot_yearly_rolling_average(csv_profile, elexon_id, year, window_days=3)
+        plot_one_day_profile(derived_profile, elexon_id, year, fes_scenario, fes_year)
+        plot_yearly_rolling_average(derived_profile, elexon_id, year, fes_scenario, fes_year, window_days=3)
 
