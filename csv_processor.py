@@ -6,6 +6,8 @@ from datetime import timedelta
 
 FILENAME_PATTERN = re.compile(r"^GP9_2023(\d{2})\.csv$")
 RAW_PROFILE_COLUMN = "Meter Volume"
+MWH_TO_MW_HALF_HOURLY_FACTOR = 2.0
+PROFILE_POWER_UNIT = "MW"
 IMPORT_EXPORT_INDICATOR_COLUMN = "Import/Export Indicator"
 SETTLEMENT_RUN_TYPE_COLUMN = "Settlement Run Type"
 FLOW_RUN_DATE_COLUMN = "Flow Run Date"
@@ -107,6 +109,36 @@ def read_excel_file():
         raise RuntimeError(f"Error reading Excel file '{excel_path}': {e}") from e
 
 
+def convert_meter_volume_mwh_to_mw(df: pd.DataFrame, source_name: str | None = None) -> tuple[pd.DataFrame, dict]:
+    if RAW_PROFILE_COLUMN not in df.columns:
+        raise KeyError(f"The dataframe does not contain a '{RAW_PROFILE_COLUMN}' column.")
+
+    meter_volume_mwh = pd.to_numeric(df[RAW_PROFILE_COLUMN], errors="coerce")
+    if meter_volume_mwh.isna().any():
+        raise ValueError(f"The '{RAW_PROFILE_COLUMN}' column contains non-numeric or missing values.")
+
+    converted_df = df.copy()
+    converted_df[RAW_PROFILE_COLUMN] = meter_volume_mwh * MWH_TO_MW_HALF_HOURLY_FACTOR
+
+    summary = {
+        "source_name": source_name,
+        "factor": MWH_TO_MW_HALF_HOURLY_FACTOR,
+        "rows_converted": int(len(converted_df)),
+        "mwh_min": float(meter_volume_mwh.min()),
+        "mwh_max": float(meter_volume_mwh.max()),
+        "mw_min": float(converted_df[RAW_PROFILE_COLUMN].min()),
+        "mw_max": float(converted_df[RAW_PROFILE_COLUMN].max()),
+    }
+
+    source_label = f" in {source_name}" if source_name else ""
+    print(
+        f"Converted '{RAW_PROFILE_COLUMN}' from MWh to {PROFILE_POWER_UNIT}{source_label} "
+        f"using factor {MWH_TO_MW_HALF_HOURLY_FACTOR:g}."
+    )
+
+    return converted_df, summary
+
+
 def read_ordered_gp9_csv_files():
     current_dir = os.path.dirname(os.path.abspath(__file__))
     files = os.listdir(current_dir)
@@ -125,6 +157,7 @@ def read_ordered_gp9_csv_files():
         file_path = os.path.join(current_dir, filename)
         try:
             df = pd.read_csv(file_path)
+            df, _ = convert_meter_volume_mwh_to_mw(df, filename)
             dataframes.append(df)
             print(f"Successfully read: {filename}")
         except Exception as e:
@@ -754,15 +787,15 @@ def scale_profile_to_net_demand_setpoints(
 
 def print_profile_scaling_summary(profile_scaling_summary: dict) -> None:
     print("\nProfile scaling summary:")
-    print(f"  Source min: {profile_scaling_summary['source_min']:,.6f}")
-    print(f"  Source max: {profile_scaling_summary['source_max']:,.6f}")
+    print(f"  Source min: {profile_scaling_summary['source_min']:,.6f} {PROFILE_POWER_UNIT}")
+    print(f"  Source max: {profile_scaling_summary['source_max']:,.6f} {PROFILE_POWER_UNIT}")
     print(
-        f"  Target floor: {profile_scaling_summary['target_floor']:,.6f} "
+        f"  Target floor: {profile_scaling_summary['target_floor']:,.6f} {PROFILE_POWER_UNIT} "
         f"({profile_scaling_summary['floor_setpoint']})"
     )
-    print(f"  Target ceiling: {profile_scaling_summary['target_ceiling']:,.6f} (Winter Peak)")
-    print(f"  Derived min: {profile_scaling_summary['derived_min']:,.6f}")
-    print(f"  Derived max: {profile_scaling_summary['derived_max']:,.6f}")
+    print(f"  Target ceiling: {profile_scaling_summary['target_ceiling']:,.6f} {PROFILE_POWER_UNIT} (Winter Peak)")
+    print(f"  Derived min: {profile_scaling_summary['derived_min']:,.6f} {PROFILE_POWER_UNIT}")
+    print(f"  Derived max: {profile_scaling_summary['derived_max']:,.6f} {PROFILE_POWER_UNIT}")
 
 
 def fill_missing_periods(df: pd.DataFrame, year: int) -> pd.DataFrame:
@@ -1011,12 +1044,12 @@ def plot_one_day_profile(
                     day_data.index,
                     day_data[SOURCE_PROFILE_COLUMN],
                     marker='o',
-                    label=SOURCE_PROFILE_COLUMN,
+                    label=f"{SOURCE_PROFILE_COLUMN} ({PROFILE_POWER_UNIT})",
                     linewidth=2,
                     markersize=4,
                 )
                 ax.set_xlabel("Time (Half-hourly)", fontsize=12)
-                ax.set_ylabel("Demand", fontsize=12)
+                ax.set_ylabel(f"Demand ({PROFILE_POWER_UNIT})", fontsize=12)
             else:
                 print(f"Column '{SOURCE_PROFILE_COLUMN}' not found. Available columns: {list(day_data.columns)}")
                 continue
@@ -1026,7 +1059,7 @@ def plot_one_day_profile(
                     day_data.index,
                     day_data[DERIVED_PROFILE_COLUMN],
                     marker='x',
-                    label=f"{DERIVED_PROFILE_COLUMN} (scaled to net setpoints)",
+                    label=f"{DERIVED_PROFILE_COLUMN} ({PROFILE_POWER_UNIT}, scaled to net setpoints)",
                     linewidth=2,
                     markersize=4,
                 )
@@ -1095,19 +1128,19 @@ def plot_yearly_rolling_average(
     ax.plot(
         df_rolling.index,
         df_rolling[SOURCE_PROFILE_COLUMN],
-        label=f"{SOURCE_PROFILE_COLUMN} ({window_days}-day MA)",
+        label=f"{SOURCE_PROFILE_COLUMN} ({PROFILE_POWER_UNIT}, {window_days}-day MA)",
         linewidth=2,
     )
     if DERIVED_PROFILE_COLUMN in df_rolling.columns:
         ax.plot(
             df_rolling.index,
             df_rolling[DERIVED_PROFILE_COLUMN],
-            label=f"{DERIVED_PROFILE_COLUMN} ({window_days}-day MA, scaled to net setpoints)",
+            label=f"{DERIVED_PROFILE_COLUMN} ({PROFILE_POWER_UNIT}, {window_days}-day MA, scaled to net setpoints)",
             linewidth=2,
         )
     
     ax.set_xlabel("Date", fontsize=12)
-    ax.set_ylabel(f"Demand ({window_days}-day Rolling Average)", fontsize=12)
+    ax.set_ylabel(f"Demand ({PROFILE_POWER_UNIT}, {window_days}-day Rolling Average)", fontsize=12)
     title = f"Yearly Profile with {window_days}-Day Rolling Average\nElexon ID: {elexon_id}, CSV Year: {year}"
     if fes_scenario is not None and fes_year is not None and DERIVED_PROFILE_COLUMN in df_rolling.columns:
         title += f", FES: {fes_scenario} {fes_year}"
