@@ -2,13 +2,18 @@ import os
 import re
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt  # type: ignore
-import matplotlib.dates as mdates  # type: ignore
 from datetime import timedelta
 
 FILENAME_PATTERN = re.compile(r"^GP9_2023(\d{2})\.csv$")
-SOURCE_PROFILE_COLUMN = "Meter Volume"
+RAW_PROFILE_COLUMN = "Meter Volume"
+IMPORT_EXPORT_INDICATOR_COLUMN = "Import/Export Indicator"
+SETTLEMENT_RUN_TYPE_COLUMN = "Settlement Run Type"
+FLOW_RUN_DATE_COLUMN = "Flow Run Date"
+DATE_OF_AGGREGATION_COLUMN = "Date of Aggregation"
+SIGNED_PROFILE_COLUMN = "Signed Meter Volume"
+SOURCE_PROFILE_COLUMN = SIGNED_PROFILE_COLUMN
 DERIVED_PROFILE_COLUMN = "Derived Net Demand"
+PREFERRED_SETTLEMENT_RUN_ORDER = ['RF','R3','R2','R1','SF','II'] #["R3", "R2", "R1", "SF", "RF", "DF", "II"]
 ACTIVE_REQUIRED_COLUMNS = {"scenario", "year", "DemandPk", "DemandAM", "DemandPM", "type"}
 ACTIVE_DEMAND_COLUMNS = ["DemandPk", "DemandAM", "DemandPM"]
 DEMAND_SETPOINTS = {
@@ -290,12 +295,8 @@ def create_datetime_index(df: pd.DataFrame) -> pd.DataFrame:
         return pd.Timestamp(year, month, day, hour, minute)
 
     df["Datetime"] = df.apply(convert_to_datetime, axis=1)
-    
-    # Keep only the first occurrence of each unique datetime (handles spring-forward day with 46 periods)
-    df = df.drop_duplicates(subset=['Datetime'], keep='first')
-    print(f"Total rows after deduplication (365*48 timesteps): {len(df)}")
-    
     df = df.set_index("Datetime")
+    print(f"Total rows after datetime indexing: {len(df)}")
     return df
 
 
@@ -324,6 +325,177 @@ def prompt_select_year(df: pd.DataFrame) -> tuple[pd.DataFrame, int]:
             print(f"Filtered dataframe to year {selected_year} with {len(filtered_df)} rows.")
             return filtered_df, selected_year
         print(f"Please enter a number between 1 and {len(unique_years)}.")
+
+
+def select_preferred_settlement_runs(df: pd.DataFrame, verbose: bool = True) -> tuple[pd.DataFrame, dict]:
+    if not isinstance(df.index, pd.DatetimeIndex):
+        raise TypeError("The dataframe index must be a DatetimeIndex.")
+    if SETTLEMENT_RUN_TYPE_COLUMN not in df.columns:
+        raise KeyError(f"The dataframe does not contain a '{SETTLEMENT_RUN_TYPE_COLUMN}' column.")
+
+    working = df.copy()
+    datetime_column = "__settlement_datetime__"
+    normalized_run_column = "__settlement_run_type_normalized__"
+    priority_column = "__settlement_run_priority__"
+    flow_run_sort_column = "__flow_run_date_sort__"
+    aggregation_sort_column = "__date_of_aggregation_sort__"
+    temp_columns = [
+        datetime_column,
+        normalized_run_column,
+        priority_column,
+        flow_run_sort_column,
+        aggregation_sort_column,
+    ]
+
+    for column in temp_columns:
+        if column in working.columns:
+            raise KeyError(f"The dataframe already contains reserved temporary column '{column}'.")
+
+    priority_map = {
+        run_type: priority
+        for priority, run_type in enumerate(PREFERRED_SETTLEMENT_RUN_ORDER)
+    }
+    working[datetime_column] = working.index
+    working[normalized_run_column] = (
+        working[SETTLEMENT_RUN_TYPE_COLUMN].astype("string").str.strip().str.upper()
+    )
+    working[normalized_run_column] = working[normalized_run_column].mask(
+        working[normalized_run_column] == ""
+    )
+    working[priority_column] = (
+        working[normalized_run_column]
+        .map(priority_map)
+        .fillna(len(PREFERRED_SETTLEMENT_RUN_ORDER))
+        .astype(int)
+    )
+    if FLOW_RUN_DATE_COLUMN in working.columns:
+        working[flow_run_sort_column] = pd.to_numeric(working[FLOW_RUN_DATE_COLUMN], errors="coerce")
+    else:
+        working[flow_run_sort_column] = np.nan
+    if DATE_OF_AGGREGATION_COLUMN in working.columns:
+        working[aggregation_sort_column] = pd.to_numeric(working[DATE_OF_AGGREGATION_COLUMN], errors="coerce")
+    else:
+        working[aggregation_sort_column] = np.nan
+
+    group_columns = [datetime_column]
+    if "GSP Id" in working.columns:
+        group_columns.insert(0, "GSP Id")
+
+    group_sizes = working.groupby(group_columns, dropna=False).size()
+    duplicate_timestep_count = int((group_sizes > 1).sum())
+
+    sort_columns = [
+        *group_columns,
+        priority_column,
+        flow_run_sort_column,
+        aggregation_sort_column,
+    ]
+    selected = (
+        working.sort_values(
+            sort_columns,
+            ascending=[True] * len(group_columns) + [True, False, False],
+            kind="mergesort",
+        )
+        .drop_duplicates(subset=group_columns, keep="first")
+        .sort_values(group_columns, kind="mergesort")
+    )
+
+    available_run_type_counts = (
+        working[normalized_run_column].fillna("<missing>").value_counts().sort_index().to_dict()
+    )
+    selected_run_type_counts = (
+        selected[normalized_run_column].fillna("<missing>").value_counts().sort_index().to_dict()
+    )
+    known_selected_mask = selected[normalized_run_column].isin(PREFERRED_SETTLEMENT_RUN_ORDER).fillna(False)
+    unknown_selected_count = int((~known_selected_mask).sum())
+    summary = {
+        "priority_order": PREFERRED_SETTLEMENT_RUN_ORDER.copy(),
+        "input_rows": int(len(working)),
+        "selected_rows": int(len(selected)),
+        "duplicate_rows_removed": int(len(working) - len(selected)),
+        "duplicate_timestep_count": duplicate_timestep_count,
+        "available_run_type_counts": {str(key): int(value) for key, value in available_run_type_counts.items()},
+        "selected_run_type_counts": {str(key): int(value) for key, value in selected_run_type_counts.items()},
+        "preferred_r3_rows": int(selected_run_type_counts.get("R3", 0)),
+        "fallback_rows": int(len(selected) - selected_run_type_counts.get("R3", 0)),
+        "unknown_selected_rows": unknown_selected_count,
+    }
+
+    selected = selected.set_index(datetime_column, drop=True)
+    selected = selected.drop(columns=[column for column in temp_columns if column != datetime_column])
+    selected.index.name = df.index.name
+
+    if verbose:
+        print("\nSettlement run selection summary:")
+        print(f"  Priority order: {' > '.join(PREFERRED_SETTLEMENT_RUN_ORDER)}")
+        print(f"  Input rows: {summary['input_rows']:,}")
+        print(f"  Selected timesteps: {summary['selected_rows']:,}")
+        print(f"  Duplicate rows removed: {summary['duplicate_rows_removed']:,}")
+        print(f"  Timesteps with duplicate settlement runs: {summary['duplicate_timestep_count']:,}")
+        print("  Selected settlement run types:")
+        for run_type in PREFERRED_SETTLEMENT_RUN_ORDER:
+            print(f"    {run_type}: {summary['selected_run_type_counts'].get(run_type, 0):,}")
+        for run_type, count in summary["selected_run_type_counts"].items():
+            if run_type not in PREFERRED_SETTLEMENT_RUN_ORDER:
+                print(f"    {run_type}: {count:,}")
+        print(f"  R3 rows used: {summary['preferred_r3_rows']:,}")
+        print(f"  Fallback rows used: {summary['fallback_rows']:,}")
+
+    return selected, summary
+
+
+def add_signed_meter_volume(df: pd.DataFrame, verbose: bool = True) -> tuple[pd.DataFrame, dict]:
+    missing_columns = [
+        column
+        for column in [RAW_PROFILE_COLUMN, IMPORT_EXPORT_INDICATOR_COLUMN]
+        if column not in df.columns
+    ]
+    if missing_columns:
+        raise KeyError(f"The dataframe is missing required GP9 columns: {missing_columns}")
+
+    raw_volume = pd.to_numeric(df[RAW_PROFILE_COLUMN], errors="coerce")
+    if raw_volume.isna().any():
+        raise ValueError(f"The '{RAW_PROFILE_COLUMN}' column contains non-numeric or missing values.")
+
+    indicator = df[IMPORT_EXPORT_INDICATOR_COLUMN].astype("string").str.strip().str.upper()
+    indicator = indicator.mask(indicator == "")
+
+    import_mask = indicator.eq("I").fillna(False)
+    export_mask = indicator.eq("E").fillna(False)
+    missing_indicator_mask = indicator.isna()
+    unknown_indicator_mask = ~(import_mask | export_mask | missing_indicator_mask)
+
+    signed_volume = raw_volume.copy()
+    signed_volume.loc[export_mask] = -raw_volume.loc[export_mask].abs()
+
+    signed_df = df.copy()
+    signed_df[SIGNED_PROFILE_COLUMN] = signed_volume
+
+    signed_summary = {
+        "total_rows": int(len(signed_df)),
+        "import_rows": int(import_mask.sum()),
+        "export_rows": int(export_mask.sum()),
+        "missing_indicator_rows": int(missing_indicator_mask.sum()),
+        "unknown_indicator_rows": int(unknown_indicator_mask.sum()),
+        "positive_export_rows_corrected": int((export_mask & (raw_volume > 0)).sum()),
+        "negative_export_rows_preserved": int((export_mask & (raw_volume < 0)).sum()),
+    }
+
+    if verbose:
+        print("\nSigned meter volume summary:")
+        print(f"  Import rows kept as provided: {signed_summary['import_rows']:,}")
+        print(f"  Export rows converted to negative flow: {signed_summary['export_rows']:,}")
+        print(f"  Positive export rows corrected: {signed_summary['positive_export_rows_corrected']:,}")
+        print(f"  Negative export rows already signed: {signed_summary['negative_export_rows_preserved']:,}")
+        if signed_summary["missing_indicator_rows"] or signed_summary["unknown_indicator_rows"]:
+            print(
+                "  Warning: "
+                f"{signed_summary['missing_indicator_rows']:,} missing and "
+                f"{signed_summary['unknown_indicator_rows']:,} unknown import/export indicators "
+                f"were left unchanged in '{SIGNED_PROFILE_COLUMN}'."
+            )
+
+    return signed_df, signed_summary
 
 
 def prompt_select_fes_scenario(active_df: pd.DataFrame) -> tuple[pd.DataFrame, str]:
@@ -644,9 +816,11 @@ def prepare_processing_data(excel_data: dict, csv_data: pd.DataFrame) -> dict:
             - 'active_demand_totals': Active DemandPk/DemandAM/DemandPM totals for scaling
             - 'gross_demand_setpoints': Gross demand setpoints from Active only
             - 'net_demand_setpoints': Net demand setpoints after storage and generation adjustments
-            - 'derived_profile': CSV profile plus the in-memory derived net demand column
+            - 'derived_profile': CSV profile plus signed meter volume and derived net demand columns
             - 'profile_scaling_summary': Source/target min-max scaling details
-            - 'csv_profile': The processed CSV data with datetime index, filtered to year
+            - 'settlement_run_summary': Settlement run priority selection counts
+            - 'signed_profile_summary': Import/export sign handling counts
+            - 'csv_profile': The processed CSV data with datetime index, filtered to year, including signed meter volume
             - 'main_data': The filtered MAIN DATA row(s) for the selected Elexon ID
             - 'gsp_info': The complete GSP info sheet (for reference/lookup)
             - 'dg_data': The complete DG sheet (for reference)
@@ -669,12 +843,20 @@ def prepare_processing_data(excel_data: dict, csv_data: pd.DataFrame) -> dict:
     csv_filtered = create_datetime_index(csv_filtered)
     csv_filtered, selected_csv_year = prompt_select_year(csv_filtered)
     
-    # Step 4: Fill missing periods
-    print("\nStep 4: Filling missing periods")
+    # Step 4: Select the best available settlement run for each timestep
+    print("\nStep 4: Selecting preferred settlement runs")
+    csv_filtered, settlement_run_summary = select_preferred_settlement_runs(csv_filtered)
+
+    # Step 5: Apply import/export sign convention before interpolation
+    print("\nStep 5: Applying import/export sign convention")
+    csv_filtered, signed_profile_summary = add_signed_meter_volume(csv_filtered)
+
+    # Step 6: Fill missing periods
+    print("\nStep 6: Filling missing periods")
     csv_filtered = fill_missing_periods(csv_filtered, selected_csv_year)
 
-    # Step 5: Select Regional FES scenario/year and calculate Active demand totals
-    print("\nStep 5: Selecting Regional FES scenario/year and calculating Active demand totals")
+    # Step 7: Select Regional FES scenario/year and calculate Active demand totals
+    print("\nStep 7: Selecting Regional FES scenario/year and calculating Active demand totals")
     active_data = filtered_excel_data.get("Active")
     if active_data is None:
         raise KeyError("The Active sheet was not loaded or filtered.")
@@ -712,6 +894,8 @@ def prepare_processing_data(excel_data: dict, csv_data: pd.DataFrame) -> dict:
         'net_demand_setpoints': net_demand_setpoints,
         'derived_profile': derived_profile,
         'profile_scaling_summary': profile_scaling_summary,
+        'settlement_run_summary': settlement_run_summary,
+        'signed_profile_summary': signed_profile_summary,
         'csv_profile': csv_filtered,
         'main_data': filtered_excel_data.get('MAIN DATA'),
         'dg_data': filtered_excel_data.get('DG'),
@@ -773,6 +957,9 @@ def plot_one_day_profile(
     """
     if not isinstance(df.index, pd.DatetimeIndex):
         raise TypeError("The dataframe index must be a DatetimeIndex.")
+
+    import matplotlib.dates as mdates  # type: ignore
+    import matplotlib.pyplot as plt  # type: ignore
     
     # Get unique dates
     unique_dates = sorted(pd.Series(df.index.date).unique().tolist())
@@ -881,6 +1068,9 @@ def plot_yearly_rolling_average(
     """
     if not isinstance(df.index, pd.DatetimeIndex):
         raise TypeError("The dataframe index must be a DatetimeIndex.")
+
+    import matplotlib.dates as mdates  # type: ignore
+    import matplotlib.pyplot as plt  # type: ignore
     
     print(f"\n{'='*80}")
     print(f"PLOT YEARLY DATA - {window_days}-DAY ROLLING AVERAGE")
@@ -951,7 +1141,6 @@ if __name__ == "__main__":
         processing_data = prepare_processing_data(excel_data, all_csv_data)
         
         # Extract components for easier access
-        csv_profile = processing_data['csv_profile']
         derived_profile = processing_data['derived_profile']
         main_data = processing_data['main_data']
         elexon_id = processing_data['elexon_id']
@@ -962,11 +1151,13 @@ if __name__ == "__main__":
         gross_demand_setpoints = processing_data['gross_demand_setpoints']
         net_demand_setpoints = processing_data['net_demand_setpoints']
         profile_scaling_summary = processing_data['profile_scaling_summary']
+        settlement_run_summary = processing_data['settlement_run_summary']
+        signed_profile_summary = processing_data['signed_profile_summary']
         
-        # Save CSV profile
-        csv_profile.to_csv("filtered_gp9_data.csv")
-        print(f"Saved filtered CSV profile to 'filtered_gp9_data.csv'")
-        print(f"\nProfile data preview:\n{csv_profile.head()}")
+        # Save derived profile
+        derived_profile.to_csv("filtered_gp9_data.csv")
+        print(f"Saved filtered derived profile to 'filtered_gp9_data.csv'")
+        print(f"\nProfile data preview:\n{derived_profile.head()}")
         
         # Display MAIN DATA if available
         if main_data is not None:
@@ -979,15 +1170,22 @@ if __name__ == "__main__":
         print_gross_demand_setpoints(gross_demand_setpoints)
         print_net_demand_setpoints(net_demand_setpoints)
         print_profile_scaling_summary(profile_scaling_summary)
+        print("\nSettlement run selected counts:")
+        for run_type, count in settlement_run_summary["selected_run_type_counts"].items():
+            print(f"  {run_type}: {count:,}")
+        print("\nSigned meter volume summary:")
+        for key, value in signed_profile_summary.items():
+            print(f"  {key}: {value:,}")
         
         print(f"\n✓ Data preparation complete and ready for profile transformation")
         print(f"  - Use 'processing_data' dict to access all excel and csv data")
-        print(f"  - processing_data['csv_profile']: Contains the profile data with set points")
+        print(f"  - processing_data['csv_profile']: Contains the raw and signed profile data")
         print(f"  - processing_data['main_data']: Contains the max/min set points from excel")
         print(f"  - processing_data['active_demand_totals']: Contains Active DemandPk/DemandAM/DemandPM totals")
         print(f"  - processing_data['gross_demand_setpoints']: Contains Active-only gross demand setpoints")
         print(f"  - processing_data['net_demand_setpoints']: Contains the final net demand setpoints")
-        print(f"  - processing_data['derived_profile']: Contains the in-memory derived net demand profile")
+        print(f"  - processing_data['settlement_run_summary']: Contains the settlement run priority summary")
+        print(f"  - processing_data['derived_profile']: Contains the signed and derived net demand profile")
         
         # Plot the selected data
         print(f"\n{'='*80}")
